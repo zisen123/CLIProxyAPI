@@ -191,6 +191,10 @@ type Manager struct {
 
 	// modelPoolOffsets tracks per-auth alias pool rotation state.
 	modelPoolOffsets map[string]int
+	// claudeStickyCursor tracks per-(auth+alias) sticky failback cursor for
+	// claude-api-key model pools. The cursor advances on retryable failure and
+	// stays on success, so traffic sticks to the current upstream until it fails.
+	claudeStickyCursor map[string]int
 
 	// runtimeConfig stores the latest application config for request-time decisions.
 	// It is initialized in NewManager; never Load() before first Store().
@@ -215,14 +219,15 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook = NoopHook{}
 	}
 	manager := &Manager{
-		store:            store,
-		executors:        make(map[string]ProviderExecutor),
-		selector:         selector,
-		hook:             hook,
-		auths:            make(map[string]*Auth),
-		homeRuntimeAuths: make(map[string]map[string]*Auth),
-		providerOffsets:  make(map[string]int),
-		modelPoolOffsets: make(map[string]int),
+		store:              store,
+		executors:          make(map[string]ProviderExecutor),
+		selector:           selector,
+		hook:               hook,
+		auths:              make(map[string]*Auth),
+		homeRuntimeAuths:   make(map[string]map[string]*Auth),
+		providerOffsets:    make(map[string]int),
+		modelPoolOffsets:   make(map[string]int),
+		claudeStickyCursor: make(map[string]int),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
@@ -598,6 +603,90 @@ func (m *Manager) resolveOpenAICompatUpstreamModelPool(auth *Auth, requestedMode
 	return resolveModelAliasPoolFromConfigModels(requestedModel, asModelAliasEntries(entry.Models))
 }
 
+// isClaudeAPIKeyPoolAuth reports whether auth is a claude-api-key auth eligible
+// for the sticky failback cursor.
+func isClaudeAPIKeyPoolAuth(auth *Auth) bool {
+	if !isAPIKeyAuth(auth) {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(auth.Provider), "claude")
+}
+
+// resolveClaudeAPIKeyUpstreamModelPool collects all upstream names sharing the
+// same alias for a claude-api-key auth, preserving config order. Used for
+// ordered sticky failback across equivalent upstream models (e.g. sophnet
+// claude-opus-4-8 / -aws / -cc / anthropic.claude-opus-4-8).
+func (m *Manager) resolveClaudeAPIKeyUpstreamModelPool(auth *Auth, requestedModel string) []string {
+	if m == nil || !isClaudeAPIKeyPoolAuth(auth) {
+		return nil
+	}
+	requestedModel = strings.TrimSpace(requestedModel)
+	if requestedModel == "" {
+		return nil
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		cfg = &internalconfig.Config{}
+	}
+	entry := resolveClaudeAPIKeyConfig(cfg, auth)
+	if entry == nil {
+		return nil
+	}
+	return resolveModelAliasPoolFromConfigModels(requestedModel, asModelAliasEntries(entry.Models))
+}
+
+// claudeStickyCursorKey builds the per-(auth+alias) key for the sticky cursor.
+func claudeStickyCursorKey(auth *Auth, routeModel string) string {
+	base := strings.TrimSpace(thinking.ParseSuffix(routeModel).ModelName)
+	if base == "" {
+		base = strings.TrimSpace(routeModel)
+	}
+	return strings.ToLower(strings.TrimSpace(auth.ID)) + "|" + strings.ToLower(base)
+}
+
+// getClaudeStickyCursor returns the current sticky cursor offset for the key.
+func (m *Manager) getClaudeStickyCursor(key string) int {
+	if m == nil || strings.TrimSpace(key) == "" {
+		return 0
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.claudeStickyCursor == nil {
+		return 0
+	}
+	return m.claudeStickyCursor[key]
+}
+
+// advanceClaudeStickyCursor moves the cursor forward to the next upstream name
+// (with wrap-around), so the next request sticks to the successor.
+func (m *Manager) advanceClaudeStickyCursor(key string, poolSize int) {
+	if m == nil || poolSize <= 1 || strings.TrimSpace(key) == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.claudeStickyCursor == nil {
+		m.claudeStickyCursor = make(map[string]int)
+	}
+	offset := m.claudeStickyCursor[key]
+	m.claudeStickyCursor[key] = (offset + 1) % poolSize
+}
+
+// onClaudePoolModelAttemptFailed advances the sticky cursor when a retryable
+// failure occurs on a claude-api-key model pool upstream. Called from the inner
+// model loop after isRequestInvalidError check (so unrecoverable errors that
+// return immediately do not advance the cursor).
+func (m *Manager) onClaudePoolModelAttemptFailed(auth *Auth, routeModel string) {
+	if !isClaudeAPIKeyPoolAuth(auth) {
+		return
+	}
+	pool := m.resolveClaudeAPIKeyUpstreamModelPool(auth, routeModel)
+	if len(pool) <= 1 {
+		return
+	}
+	m.advanceClaudeStickyCursor(claudeStickyCursorKey(auth, routeModel), len(pool))
+}
+
 func preserveRequestedModelSuffix(requestedModel, resolved string) string {
 	return preserveResolvedModelSuffix(resolved, thinking.ParseSuffix(requestedModel))
 }
@@ -616,6 +705,16 @@ func (m *Manager) executionModelCandidates(auth *Auth, routeModel string) []stri
 		}
 		offset := m.nextModelPoolOffset(openAICompatModelPoolKey(auth, requestedModel), len(pool))
 		return rotateStrings(pool, offset)
+	}
+	if pool := m.resolveClaudeAPIKeyUpstreamModelPool(auth, requestedModel); len(pool) > 0 {
+		if len(pool) == 1 {
+			return pool
+		}
+		// Sticky failback: start from the cursor position (no round-robin). The
+		// inner loop tries pool[cursor] first; on retryable failure the cursor
+		// advances, so traffic sticks to the current upstream until it fails.
+		cursor := m.getClaudeStickyCursor(claudeStickyCursorKey(auth, requestedModel)) % len(pool)
+		return rotateStrings(pool, cursor)
 	}
 	resolved := m.applyAPIKeyModelAlias(auth, requestedModel)
 	if strings.TrimSpace(resolved) == "" {
@@ -1158,6 +1257,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				return nil, errStream
 			}
 			lastErr = errStream
+			m.onClaudePoolModelAttemptFailed(auth, routeModel)
 			continue
 		}
 
@@ -1188,6 +1288,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				m.MarkResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
 				lastErr = bootstrapErr
+				m.onClaudePoolModelAttemptFailed(auth, routeModel)
 				continue
 			}
 			rerr := &Error{Message: bootstrapErr.Error()}
@@ -1207,6 +1308,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			m.MarkResult(ctx, result)
 			if idx < len(execModels)-1 {
 				lastErr = emptyErr
+				m.onClaudePoolModelAttemptFailed(auth, routeModel)
 				continue
 			}
 			return nil, newStreamBootstrapError(emptyErr, streamResult.Headers)
@@ -1484,6 +1586,14 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 	delete(m.auths, id)
 	if m.modelPoolOffsets != nil {
 		delete(m.modelPoolOffsets, id)
+	}
+	if m.claudeStickyCursor != nil {
+		prefix := strings.ToLower(strings.TrimSpace(id)) + "|"
+		for k := range m.claudeStickyCursor {
+			if strings.HasPrefix(k, prefix) {
+				delete(m.claudeStickyCursor, k)
+			}
+		}
 	}
 	for sessionID, sessionAuths := range m.homeRuntimeAuths {
 		if sessionAuths == nil {
@@ -1837,6 +1947,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
+				m.onClaudePoolModelAttemptFailed(auth, routeModel)
 				continue
 			}
 			m.MarkResult(execCtx, result)
@@ -1938,6 +2049,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
+				m.onClaudePoolModelAttemptFailed(auth, routeModel)
 				continue
 			}
 			m.MarkResult(execCtx, result)
