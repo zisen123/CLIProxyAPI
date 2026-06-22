@@ -604,6 +604,12 @@ type OpenAICompatibility struct {
 
 	// DisableCooling disables auth/model cooldown scheduling for this provider when true.
 	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
+
+	// MaxCompletionTokensCompat rewrites the client-supplied "max_tokens" field
+	// to the upstream "max_completion_tokens" field for providers that require it
+	// (e.g. sophnet gpt-5.x reasoning models reject "max_tokens"). Only takes
+	// effect when the request body actually contains "max_tokens".
+	MaxCompletionTokensCompat bool `yaml:"max-completion-tokens-compat,omitempty" json:"max-completion-tokens-compat,omitempty"`
 }
 
 // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.

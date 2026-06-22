@@ -22,6 +22,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -105,6 +106,10 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	if opts.Alt == "responses/compact" {
 		to = sdktranslator.FromString("openai-response")
 		endpoint = "/responses/compact"
+	} else if opts.SourceFormat.String() == "openai-response" {
+		// Full OpenAI Responses API endpoint (e.g. sophnet /v1/responses).
+		to = sdktranslator.FromString("openai-response")
+		endpoint = "/responses"
 	}
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
@@ -122,6 +127,9 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
+	if auth != nil && auth.Attributes != nil && auth.Attributes["max_completion_tokens_compat"] == "true" {
+		translated = rewriteMaxTokensToCompletion(translated)
+	}
 	if opts.Alt == "responses/compact" {
 		if updated, errDelete := sjson.DeleteBytes(translated, "stream"); errDelete == nil {
 			translated = updated
@@ -307,6 +315,15 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("openai")
+	endpoint := "/chat/completions"
+	if opts.Alt == "responses/compact" {
+		to = sdktranslator.FromString("openai-response")
+		endpoint = "/responses/compact"
+	} else if opts.SourceFormat.String() == "openai-response" {
+		// Full OpenAI Responses API endpoint (e.g. sophnet /v1/responses).
+		to = sdktranslator.FromString("openai-response")
+		endpoint = "/responses"
+	}
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
@@ -323,13 +340,16 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
+	if auth != nil && auth.Attributes != nil && auth.Attributes["max_completion_tokens_compat"] == "true" {
+		translated = rewriteMaxTokensToCompletion(translated)
+	}
 
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.
 	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
-	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
+	url := strings.TrimSuffix(baseURL, "/") + endpoint
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return nil, err
@@ -778,6 +798,31 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 		return payload
 	}
 	payload, _ = sjson.SetBytes(payload, "model", model)
+	return payload
+}
+
+// rewriteMaxTokensToCompletion rewrites a client-supplied "max_tokens" field
+// into the upstream "max_completion_tokens" field. It is a no-op when the body
+// has no "max_tokens", and only drops "max_tokens" (keeping the existing value)
+// when "max_completion_tokens" is already present. Required by providers such as
+// sophnet whose gpt-5.x reasoning models reject "max_tokens".
+func rewriteMaxTokensToCompletion(payload []byte) []byte {
+	if !gjson.GetBytes(payload, "max_tokens").Exists() {
+		return payload
+	}
+	if gjson.GetBytes(payload, "max_completion_tokens").Exists() {
+		if updated, err := sjson.DeleteBytes(payload, "max_tokens"); err == nil {
+			return updated
+		}
+		return payload
+	}
+	value := gjson.GetBytes(payload, "max_tokens").Value()
+	if updated, err := sjson.DeleteBytes(payload, "max_tokens"); err == nil {
+		payload = updated
+	}
+	if updated, err := sjson.SetBytes(payload, "max_completion_tokens", value); err == nil {
+		return updated
+	}
 	return payload
 }
 
