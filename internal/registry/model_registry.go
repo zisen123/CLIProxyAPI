@@ -1043,6 +1043,17 @@ func (r *ModelRegistry) GetModelProviders(modelID string) []string {
 	defer r.mutex.RUnlock()
 
 	registration, exists := r.models[modelID]
+	// Fallback: case-insensitive lookup so downstream callers may use any casing
+	// (e.g. "glm-5.2" resolves to a model registered as "GLM-5.2").
+	if !exists {
+		for name, reg := range r.models {
+			if strings.EqualFold(name, modelID) {
+				registration = reg
+				exists = true
+				break
+			}
+		}
+	}
 	if !exists || registration == nil || len(registration.Providers) == 0 {
 		return nil
 	}
