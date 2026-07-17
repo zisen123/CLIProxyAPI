@@ -286,7 +286,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if err != nil {
 		return resp, err
 	}
-	if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg, baseModel); errHeaders != nil {
+	if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg); errHeaders != nil {
 		return resp, errHeaders
 	}
 	var authID, authLabel, authType, authValue string
@@ -475,7 +475,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return nil, err
 	}
-	if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, true, extraBetas, e.cfg, baseModel); errHeaders != nil {
+	if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, true, extraBetas, e.cfg); errHeaders != nil {
 		return nil, errHeaders
 	}
 	var authID, authLabel, authType, authValue string
@@ -731,7 +731,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
-	if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg, baseModel); errHeaders != nil {
+	if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg); errHeaders != nil {
 		return cliproxyexecutor.Response{}, errHeaders
 	}
 	var authID, authLabel, authType, authValue string
@@ -863,39 +863,6 @@ func extractAndRemoveBetas(body []byte) ([]string, []byte) {
 	}
 	body, _ = sjson.DeleteBytes(body, "betas")
 	return betas, body
-}
-
-// isBedrockBackedClaudeModel reports whether baseModel routes to a Bedrock
-// backend. sophnet exposes Bedrock-backed Claude variants as model ids with a
-// "-aws" suffix (e.g. "claude-opus-4-8-aws") or an "anthropic." prefix (e.g.
-// "anthropic.claude-opus-4-8"), mirroring the Bedrock model id convention.
-// These backends reject some first-party beta flags (notably
-// redact-thinking-2026-02-12) with HTTP 400 "invalid beta flag".
-func isBedrockBackedClaudeModel(baseModel string) bool {
-	if baseModel == "" {
-		return false
-	}
-	if strings.HasSuffix(baseModel, "-aws") || strings.HasPrefix(baseModel, "anthropic.") {
-		return true
-	}
-	return false
-}
-
-// stripBetaFlag removes a single beta flag from a comma-separated beta list
-// string, collapsing any resulting empty entries or dangling separators.
-func stripBetaFlag(betas, flag string) string {
-	if betas == "" || flag == "" {
-		return betas
-	}
-	var kept []string
-	for _, b := range strings.Split(betas, ",") {
-		if strings.TrimSpace(b) != strings.TrimSpace(flag) {
-			if t := strings.TrimSpace(b); t != "" {
-				kept = append(kept, t)
-			}
-		}
-	}
-	return strings.Join(kept, ",")
 }
 
 // disableThinkingIfToolChoiceForced checks if tool_choice forces tool use and disables thinking.
@@ -1080,7 +1047,7 @@ func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadClos
 	return body, nil
 }
 
-func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, stream bool, extraBetas []string, cfg *config.Config, baseModel string) error {
+func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, stream bool, extraBetas []string, cfg *config.Config) error {
 	if r == nil {
 		return nil
 	}
@@ -1147,13 +1114,6 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 				existingSet[beta] = true
 			}
 		}
-	}
-	// Bedrock-backed Claude models (model id suffix "-aws" or prefix "anthropic.")
-	// reject the redact-thinking-2026-02-12 beta flag with HTTP 400 "invalid
-	// beta flag". Strip it from the final beta list so those upstreams accept
-	// the request. First-party and Claude Code-style model ids are unaffected.
-	if isBedrockBackedClaudeModel(baseModel) && strings.Contains(baseBetas, "redact-thinking-2026-02-12") {
-		baseBetas = stripBetaFlag(baseBetas, "redact-thinking-2026-02-12")
 	}
 	r.Header.Set("Anthropic-Beta", baseBetas)
 
