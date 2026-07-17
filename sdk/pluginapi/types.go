@@ -253,6 +253,8 @@ type AuthParseResponse struct {
 	Handled bool
 	// Auth is the parsed auth record when Handled is true.
 	Auth AuthData
+	// Auths contains multiple parsed auth records when one auth material expands into several runtime auths.
+	Auths []AuthData
 }
 
 // AuthProvider parses, logs in, polls, and refreshes plugin provider auths.
@@ -326,6 +328,8 @@ type AuthLoginPollResponse struct {
 	Message string
 	// Auth is the completed auth record when Status is success.
 	Auth AuthData
+	// Auths contains multiple completed auth records when one login flow expands into several runtime auths.
+	Auths []AuthData
 }
 
 // AuthRefreshRequest asks a plugin to refresh provider auth data.
@@ -1272,6 +1276,9 @@ type UsageRecord struct {
 	ReasoningEffort string
 	// ServiceTier records the requested or reported service tier.
 	ServiceTier string
+	// Generate reports whether the client requested actual generation.
+	// The host normalizes omitted usage.Record values to true before delivery.
+	Generate bool
 	// RequestedAt is the time the request was received.
 	RequestedAt time.Time
 	// Latency is the total request latency.

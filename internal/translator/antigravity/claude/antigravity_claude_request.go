@@ -1,8 +1,8 @@
 // Package claude provides request translation functionality for Claude Code API compatibility.
-// This package handles the conversion of Claude Code API requests into Gemini CLI-compatible
+// This package handles the conversion of Claude Code API requests into Antigravity-compatible
 // JSON format, transforming message contents, system instructions, and tool declarations
-// into the format expected by Gemini CLI API clients. It performs JSON data transformation
-// to ensure compatibility between Claude Code API format and Gemini CLI API's expected format.
+// into the format expected by Antigravity API clients. It performs JSON data transformation
+// to ensure compatibility between Claude Code API format and Antigravity API's expected format.
 package claude
 
 import (
@@ -12,6 +12,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
@@ -288,12 +289,12 @@ func logDroppedAntigravityToolUseSignature(modelName string, messageIndex, conte
 	}).Debug("antigravity claude translator: dropped tool_use signature field")
 }
 
-// ConvertClaudeRequestToAntigravity parses and transforms a Claude Code API request into Gemini CLI API format.
+// ConvertClaudeRequestToAntigravity parses and transforms a Claude Code API request into Antigravity API format.
 // It extracts the model name, system instruction, message contents, and tool declarations
-// from the raw JSON request and returns them in the format expected by the Gemini CLI API.
+// from the raw JSON request and returns them in the format expected by the Antigravity API.
 // The function performs the following transformations:
 // 1. Extracts the model information from the request
-// 2. Restructures the JSON to match Gemini CLI API format
+// 2. Restructures the JSON to match Antigravity API format
 // 3. Converts system instructions to the expected format
 // 4. Maps message contents with proper role transformations
 // 5. Handles tool declarations and tool choices
@@ -305,13 +306,14 @@ func logDroppedAntigravityToolUseSignature(modelName string, messageIndex, conte
 //   - stream: A boolean indicating if the request is for a streaming response (unused in current implementation)
 //
 // Returns:
-//   - []byte: The transformed request data in Gemini CLI API format
+//   - []byte: The transformed request data in Antigravity API format
 func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ bool) []byte {
 	enableThoughtTranslate := true
 	rawJSON := inputRawJSON
 	if shouldBuildAntigravityWebSearchRequest(modelName, rawJSON) {
 		return buildAntigravityWebSearchRequest(modelName, rawJSON)
 	}
+	functionNameMap := util.SanitizedFunctionNameMap(rawJSON)
 
 	// system instruction
 	var systemInstructionJSON []byte
@@ -370,6 +372,16 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 			clientContentJSON := []byte(`{"role":"","parts":[]}`)
 			clientContentJSON, _ = sjson.SetBytes(clientContentJSON, "role", role)
 			contentsResult := messageResult.Get("content")
+			if originalRole == "system" {
+				if reminderText, ok := translatorcommon.ClaudeMessageSystemReminderText(contentsResult); ok {
+					partJSON := []byte(`{}`)
+					partJSON, _ = sjson.SetBytes(partJSON, "text", reminderText)
+					clientContentJSON, _ = sjson.SetRawBytes(clientContentJSON, "parts.-1", partJSON)
+					contentsJSON, _ = sjson.SetRawBytes(contentsJSON, "-1", clientContentJSON)
+					hasContents = true
+				}
+				continue
+			}
 			if contentsResult.IsArray() {
 				contentResults := contentsResult.Array()
 				numContents := len(contentResults)
@@ -425,12 +437,13 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 						// NOTE: Do NOT inject dummy thinking blocks here.
 						// Antigravity API validates signatures, so dummy values are rejected.
 
-						functionName := util.SanitizeFunctionName(contentResult.Get("name").String())
+						originalFunctionName := contentResult.Get("name").String()
+						functionName := util.MapSanitizedFunctionName(functionNameMap, originalFunctionName)
 						argsResult := contentResult.Get("input")
 						functionID := contentResult.Get("id").String()
 
-						if functionID != "" && functionName != "" {
-							toolNameByID[functionID] = functionName
+						if functionID != "" && originalFunctionName != "" {
+							toolNameByID[functionID] = originalFunctionName
 						}
 
 						// Handle both object and string input formats
@@ -483,7 +496,7 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 
 							functionResponseJSON := []byte(`{}`)
 							functionResponseJSON, _ = sjson.SetBytes(functionResponseJSON, "id", toolCallID)
-							functionResponseJSON, _ = sjson.SetBytes(functionResponseJSON, "name", util.SanitizeFunctionName(funcName))
+							functionResponseJSON, _ = sjson.SetBytes(functionResponseJSON, "name", util.MapSanitizedFunctionName(functionNameMap, funcName))
 
 							responseData := ""
 							if functionResponseResult.Type == gjson.String {
@@ -664,7 +677,7 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 				inputSchema := util.CleanJSONSchemaForAntigravity(inputSchemaResult.Raw)
 				tool, _ := sjson.DeleteBytes([]byte(toolResult.Raw), "input_schema")
 				tool, _ = sjson.SetRawBytes(tool, "parametersJsonSchema", []byte(inputSchema))
-				tool, _ = sjson.SetBytes(tool, "name", util.SanitizeFunctionName(gjson.GetBytes(tool, "name").String()))
+				tool, _ = sjson.SetBytes(tool, "name", util.MapSanitizedFunctionName(functionNameMap, gjson.GetBytes(tool, "name").String()))
 				for toolKey := range gjson.ParseBytes(tool).Map() {
 					if util.InArray(allowedToolKeys, toolKey) {
 						continue
@@ -676,12 +689,18 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 			}
 		}
 		if toolDeclCount > 0 {
-			toolsJSON = []byte(`[]`)
-			toolsJSON, _ = sjson.SetRawBytes(toolsJSON, "-1", functionToolNode)
+			declarations := gjson.GetBytes(functionToolNode, "functionDeclarations")
+			deduplicated := util.DeduplicateFunctionDeclarations([]byte(declarations.Raw))
+			functionToolNode, _ = sjson.SetRawBytes(functionToolNode, "functionDeclarations", deduplicated)
+			toolDeclCount = len(gjson.ParseBytes(deduplicated).Array())
+			if toolDeclCount > 0 {
+				toolsJSON = []byte(`[]`)
+				toolsJSON, _ = sjson.SetRawBytes(toolsJSON, "-1", functionToolNode)
+			}
 		}
 	}
 
-	// Build output Gemini CLI request JSON
+	// Build output Antigravity request JSON
 	out := []byte(`{"model":"","request":{"contents":[]}}`)
 	out, _ = sjson.SetBytes(out, "model", modelName)
 
@@ -742,7 +761,7 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 		case "tool":
 			out, _ = sjson.SetBytes(out, "request.toolConfig.functionCallingConfig.mode", "ANY")
 			if toolChoiceName != "" {
-				out, _ = sjson.SetBytes(out, "request.toolConfig.functionCallingConfig.allowedFunctionNames", []string{util.SanitizeFunctionName(toolChoiceName)})
+				out, _ = sjson.SetBytes(out, "request.toolConfig.functionCallingConfig.allowedFunctionNames", []string{util.MapSanitizedFunctionName(functionNameMap, toolChoiceName)})
 			}
 		}
 	}
